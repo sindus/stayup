@@ -194,7 +194,7 @@ class TestInitDb:
     def test_executes_ddl_and_commits(self):
         conn, cursor = make_conn_mock()
         init_db(conn)
-        assert cursor.execute.call_count == 1  # DDL only
+        assert cursor.execute.call_count == 2  # DDL + ALTER TABLE migration
         conn.commit.assert_called_once()
 
 

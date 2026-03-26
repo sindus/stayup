@@ -41,6 +41,7 @@ DDL = """
 CREATE TABLE IF NOT EXISTS repository (
     id          SERIAL PRIMARY KEY,
     url         TEXT NOT NULL UNIQUE,
+    config      JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -94,6 +95,7 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
     """Create tables if they don't exist."""
     with conn.cursor() as cur:
         cur.execute(DDL)
+        cur.execute("ALTER TABLE repository ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}';")
     conn.commit()
 
 
