@@ -96,8 +96,6 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
     """Create tables if they don't exist and apply pending migrations."""
     with conn.cursor() as cur:
         cur.execute(DDL)
-        cur.execute("ALTER TABLE repository ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}';")
-        cur.execute("ALTER TABLE connector_changelog DROP COLUMN IF EXISTS diff;")
     conn.commit()
 
 
