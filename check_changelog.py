@@ -97,17 +97,6 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
     """Create tables if they don't exist and apply pending migrations."""
     with conn.cursor() as cur:
         cur.execute(DDL)
-        cur.execute("""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = 'connector_changelog' AND column_name = 'provider_id'
-                ) THEN
-                    ALTER TABLE connector_changelog RENAME COLUMN provider_id TO repository_id;
-                END IF;
-            END $$;
-            """)
     conn.commit()
 
 
