@@ -40,7 +40,7 @@ DDL = """
 CREATE TABLE IF NOT EXISTS repository (
     id          SERIAL PRIMARY KEY,
     url         TEXT NOT NULL UNIQUE,
-    type        TEXT NOT NULL DEFAULT 'changelog',
+    type        TEXT NOT NULL,
     config      JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
