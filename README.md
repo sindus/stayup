@@ -3,6 +3,8 @@
 [![CI](https://github.com/stayup-app/stayup-cmd-changelog/actions/workflows/ci.yml/badge.svg)](https://github.com/stayup-app/stayup-cmd-changelog/actions/workflows/ci.yml)
 [![Daily changelog check](https://github.com/stayup-app/stayup-cmd-changelog/actions/workflows/daily.yml/badge.svg)](https://github.com/stayup-app/stayup-cmd-changelog/actions/workflows/daily.yml)
 
+**Website:** https://stayup-ui.vercel.app
+
 Monitors GitHub releases and stores changelogs in a PostgreSQL database.
 
 For each tracked repository, the script fetches the latest GitHub release. If no release exists, it falls back to reading a changelog file from the repository. A new entry is only stored when something has changed since the last run. The three most recent entries per repository are kept.
