@@ -63,19 +63,101 @@ CREATE TABLE IF NOT EXISTS log (
     executed_at     TIMESTAMPTZ NOT NULL
 );
 
--- Registre partagé des providers : chaque collecteur y déclare son nom affiché au
--- démarrage. L'API stayup-api lit cette table pour construire une UI dynamique ;
--- elle ne connaît aucun nom de provider en dur, seulement les tables connector_*.
+-- Registre partagé des providers : chaque collecteur y déclare son nom affiché et
+-- son template d'affichage au démarrage. L'API stayup-api lit cette table pour
+-- construire une UI dynamique ; elle ne connaît aucun nom de provider en dur,
+-- seulement les tables connector_*. Le registre est renseigné juste après ce DDL
+-- (voir REGISTER_PROVIDER_SQL) — pas ici, pour passer le template en paramètre.
 CREATE TABLE IF NOT EXISTS provider_registry (
     name          TEXT PRIMARY KEY,
     display_name  TEXT NOT NULL,
     sort_order    INTEGER NOT NULL DEFAULT 100,
+    template      JSONB,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO provider_registry (name, display_name, sort_order)
-VALUES ('changelog', 'Changelog', 10)
-ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = NOW();
+-- Registre antérieur à la colonne `template` : on l'ajoute sans rien réécrire.
+ALTER TABLE provider_registry ADD COLUMN IF NOT EXISTS template JSONB;
+"""
+
+PROVIDER_TYPE = "changelog"
+
+# Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
+DISPLAY_NAME = "Changelog"
+
+# Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
+# lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
+# tel quel depuis provider_registry.template, sans jamais l'interpréter.
+# Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
+#
+# Une ligne connector_changelog = une release. `content` est du texte brut
+# (markdown léger), le dépôt vient de la source (repository.url).
+DISPLAY_TEMPLATE = {
+    "version": 1,
+    "display": {
+        "name": DISPLAY_NAME,
+        # Icône auto-descriptive (tracé SVG teintable, langage visuel des apps :
+        # trait 1.75, currentColor). Un tag de release.
+        "icon": {
+            "paths": [
+                "M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z",
+                "M7 7h.01",
+            ],
+            "viewBox": "0 0 24 24",
+            "stroke": True,
+        },
+        "accent": "#f4b585",
+        "sortOrder": 10,
+        "feedLabel": {"path": "$source.url", "format": "urlSlug"},
+    },
+    "item": {
+        "parseContentAsJson": False,
+        "vars": {"repo": {"path": "$source.url", "format": "urlSlug"}},
+        "fields": {
+            "title": "{repo}",
+            "subtitle": "$row.version",
+            "summary": {"path": "content", "format": "stripMarkdown"},
+            "url": "https://github.com/{repo}/releases/tag/{$row.version}",
+            "timestamp": "$row.datetime",
+        },
+    },
+    "list": {
+        "layout": "row",
+        "primary": "title",
+        "secondary": "subtitle",
+        "meta": "timestamp",
+        "snippet": "summary",
+    },
+    "detail": {
+        "mode": "text",
+        "title": "{repo}",
+        "badge": "$row.version",
+        "body": {"path": "content", "format": "stripMarkdown"},
+        "openUrl": "https://github.com/{repo}/releases/tag/{$row.version}",
+        "openLabel": "Open on GitHub",
+    },
+    "form": {
+        "label": "GitHub repo (owner/repo or URL)",
+        "placeholder": "vercel/next.js",
+        "urlTemplate": "https://github.com/{value}/",
+        "transform": {
+            "trim": True,
+            "extract": r"github\.com/([^/]+/[^/]+)",
+            "stripSuffix": [".git", "/"],
+        },
+    },
+}
+
+# Upsert du registre, template passé en paramètre (le JSON contient des guillemets
+# et échapperait mal dans un DDL littéral). `sort_order` n'est pas réécrit sur
+# conflit, par cohérence avec les autres collecteurs stayup-cmd-*.
+REGISTER_PROVIDER_SQL = """
+INSERT INTO provider_registry (name, display_name, sort_order, template)
+VALUES (%s, %s, %s, %s::jsonb)
+ON CONFLICT (name) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    template     = EXCLUDED.template,
+    updated_at   = NOW();
 """
 
 
@@ -103,9 +185,13 @@ def get_db_conn() -> psycopg2.extensions.connection:
 
 
 def init_db(conn: psycopg2.extensions.connection) -> None:
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist and register the provider (name + display template)."""
     with conn.cursor() as cur:
         cur.execute(DDL)
+        cur.execute(
+            REGISTER_PROVIDER_SQL,
+            (PROVIDER_TYPE, DISPLAY_NAME, 10, json.dumps(DISPLAY_TEMPLATE)),
+        )
     conn.commit()
 
 

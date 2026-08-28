@@ -1,11 +1,13 @@
 """Unit tests — no external dependencies (DB, git, network)."""
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from check_changelog import (
+    DISPLAY_TEMPLATE,
     cleanup_old_entries,
     clone_repo,
     find_changelog,
@@ -178,19 +180,48 @@ def make_conn_mock():
 
 
 class TestInitDb:
-    def test_executes_ddl_and_commits(self):
+    def test_runs_ddl_then_registers_provider_and_commits(self):
         conn, cursor = make_conn_mock()
         init_db(conn)
-        assert cursor.execute.call_count == 1  # DDL only
+        assert cursor.execute.call_count == 2  # DDL, then registry upsert
         conn.commit.assert_called_once()
 
-    def test_ddl_registers_the_provider(self):
+    def test_ddl_creates_registry_with_template_column(self):
         conn, cursor = make_conn_mock()
         init_db(conn)
-        sql = cursor.execute.call_args[0][0]
-        assert "CREATE TABLE IF NOT EXISTS provider_registry" in sql
+        ddl = cursor.execute.call_args_list[0].args[0]
+        assert "CREATE TABLE IF NOT EXISTS provider_registry" in ddl
+        assert "ADD COLUMN IF NOT EXISTS template" in ddl
+
+    def test_registers_provider_name_and_display_template(self):
+        conn, cursor = make_conn_mock()
+        init_db(conn)
+        sql, params = cursor.execute.call_args_list[1].args
         assert "INSERT INTO provider_registry" in sql
-        assert "'changelog', 'Changelog'" in sql
+        assert "template" in sql
+        name, display, sort_order, template_json = params
+        assert (name, display, sort_order) == ("changelog", "Changelog", 10)
+        assert json.loads(template_json) == DISPLAY_TEMPLATE
+
+
+class TestDisplayTemplate:
+    def test_round_trips_through_json_unchanged(self):
+        assert json.loads(json.dumps(DISPLAY_TEMPLATE)) == DISPLAY_TEMPLATE
+
+    def test_ships_a_self_describing_icon(self):
+        # Le connecteur fournit son icône (tracé SVG teintable), pas une clé du
+        # jeu intégré des apps : un nouveau connecteur s'affiche sans toucher au code.
+        icon = DISPLAY_TEMPLATE["display"]["icon"]
+        assert isinstance(icon, dict)
+        assert icon["paths"]
+        assert all(p[:1] in ("M", "m") for p in icon["paths"])
+        assert icon["viewBox"] == "0 0 24 24"
+
+    def test_text_detail_with_open_on_github(self):
+        assert DISPLAY_TEMPLATE["version"] == 1
+        assert DISPLAY_TEMPLATE["detail"]["mode"] == "text"
+        assert DISPLAY_TEMPLATE["detail"]["openLabel"] == "Open on GitHub"
+        assert "{repo}" in DISPLAY_TEMPLATE["detail"]["openUrl"]
 
 
 class TestUpsertRepository:

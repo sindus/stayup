@@ -14,6 +14,7 @@ import psycopg2
 import pytest
 
 from check_changelog import (
+    DISPLAY_TEMPLATE,
     cleanup_old_entries,
     clone_repo,
     init_db,
@@ -22,6 +23,24 @@ from check_changelog import (
     save_error,
     upsert_repository,
 )
+
+
+class TestInitDb:
+    def test_registers_name_and_display_template(self, db_conn):
+        init_db(db_conn)
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT display_name, sort_order, template FROM provider_registry WHERE name = 'changelog'")
+            display_name, sort_order, template = cur.fetchone()
+        assert (display_name, sort_order) == ("Changelog", 10)
+        assert template == DISPLAY_TEMPLATE  # psycopg2 decodes JSONB
+
+    def test_is_idempotent(self, db_conn):
+        init_db(db_conn)
+        init_db(db_conn)
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM provider_registry WHERE name = 'changelog'")
+            assert cur.fetchone()[0] == 1
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
