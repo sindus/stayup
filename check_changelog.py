@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Stayup — monitors GitHub releases and stores changelogs in PostgreSQL.
+Stayup — monitors GitHub releases and stores changelogs via stayup-api.
 
 For each tracked repository, the script fetches recent GitHub releases.
 If no releases exist, it falls back to cloning the repo and reading a
 changelog file. New content is stored only when something has changed
 since the last run. Entries older than config["retention_days"] are deleted each run.
+
+Talks to stayup-api over HTTP (STAYUP_API_URL + STAYUP_API_KEY) — it never
+touches a database directly. See stayup-api/docs/self-hosting-and-providers.md.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -19,7 +22,6 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-import psycopg2
 import requests
 
 # Candidate changelog filenames, checked in priority order.
@@ -37,61 +39,30 @@ CHANGELOG_NAMES = [
     "HISTORY.txt",
 ]
 
-DDL = """
-CREATE TABLE IF NOT EXISTS repository (
-    id          SERIAL PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
-    type        TEXT NOT NULL,
-    config      JSONB NOT NULL DEFAULT '{}',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS connector_changelog (
-    id              SERIAL PRIMARY KEY,
-    repository_id   INTEGER NOT NULL REFERENCES repository(id),
-    version         TEXT,
-    content         TEXT NOT NULL,
-    datetime        TIMESTAMPTZ,
-    executed_at     TIMESTAMPTZ NOT NULL,
-    success         BOOLEAN NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS log (
-    id              SERIAL PRIMARY KEY,
-    repository_id   INTEGER,
-    error           TEXT NOT NULL,
-    executed_at     TIMESTAMPTZ NOT NULL
-);
-
--- Registre partagé des providers : chaque collecteur y déclare son nom affiché et
--- son template d'affichage au démarrage. L'API stayup-api lit cette table pour
--- construire une UI dynamique ; elle ne connaît aucun nom de provider en dur,
--- seulement les tables connector_*. Le registre est renseigné juste après ce DDL
--- (voir REGISTER_PROVIDER_SQL) — pas ici, pour passer le template en paramètre.
-CREATE TABLE IF NOT EXISTS provider_registry (
-    name          TEXT PRIMARY KEY,
-    display_name  TEXT NOT NULL,
-    sort_order    INTEGER NOT NULL DEFAULT 100,
-    template      JSONB,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Registre antérieur à la colonne `template` : on l'ajoute sans rien réécrire.
-ALTER TABLE provider_registry ADD COLUMN IF NOT EXISTS template JSONB;
-"""
-
 PROVIDER_TYPE = "changelog"
 
 # Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
 DISPLAY_NAME = "Changelog"
+
+# Où ce connecteur se classe parmi les autres dans la barre latérale.
+SORT_ORDER = 10
+
+# Instance stayup-api à laquelle parler, et la clé qui authentifie ce
+# connecteur pour le provider 'changelog' — obtenue depuis l'admin de cette
+# instance (voir stayup-api/docs/self-hosting-and-providers.md).
+API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
+API_KEY = os.environ.get("STAYUP_API_KEY")
+
+DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_RETENTION_DAYS = 15
 
 # Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
 # lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
 # tel quel depuis provider_registry.template, sans jamais l'interpréter.
 # Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
 #
-# Une ligne connector_changelog = une release. `content` est du texte brut
-# (markdown léger), le dépôt vient de la source (repository.url).
+# Une entrée = une release. `content` est du texte brut (markdown léger), le
+# dépôt vient de la source (repository.url).
 DISPLAY_TEMPLATE = {
     "version": 1,
     "display": {
@@ -107,7 +78,7 @@ DISPLAY_TEMPLATE = {
             "stroke": True,
         },
         "accent": "#f4b585",
-        "sortOrder": 10,
+        "sortOrder": SORT_ORDER,
         "feedLabel": {"path": "$source.url", "format": "urlSlug"},
     },
     "item": {
@@ -148,156 +119,102 @@ DISPLAY_TEMPLATE = {
     },
 }
 
-# Upsert du registre, template passé en paramètre (le JSON contient des guillemets
-# et échapperait mal dans un DDL littéral). `sort_order` n'est pas réécrit sur
-# conflit, par cohérence avec les autres collecteurs stayup-cmd-*.
-REGISTER_PROVIDER_SQL = """
-INSERT INTO provider_registry (name, display_name, sort_order, template)
-VALUES (%s, %s, %s, %s::jsonb)
-ON CONFLICT (name) DO UPDATE SET
-    display_name = EXCLUDED.display_name,
-    template     = EXCLUDED.template,
-    updated_at   = NOW();
-"""
-
 
 # ---------------------------------------------------------------------------
-# Database
+# stayup-api client
 # ---------------------------------------------------------------------------
 
 
-def get_db_conn() -> psycopg2.extensions.connection:
-    """Return a psycopg2 connection.
+def api_request(method: str, path: str, **kwargs) -> dict | None:
+    """Call one of stayup-api's /connector-api/changelog/* endpoints.
 
-    Reads DATABASE_URL first; falls back to individual DB_* environment
-    variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD).
+    Raises RuntimeError if STAYUP_API_KEY isn't set, or requests.HTTPError on
+    a non-2xx response (via raise_for_status).
     """
-    database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        return psycopg2.connect(database_url)
-    return psycopg2.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
+    if not API_KEY:
+        raise RuntimeError("STAYUP_API_KEY is not set.")
+    url = f"{API_URL}/connector-api/{PROVIDER_TYPE}{path}"
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+    response.raise_for_status()
+    return response.json() if response.content else None
+
+
+def register_provider() -> None:
+    """Auto-déclaration au démarrage — nom affiché et manifeste d'affichage."""
+    api_request(
+        "POST",
+        "/register",
+        json={
+            "displayName": DISPLAY_NAME,
+            "sortOrder": SORT_ORDER,
+            "template": DISPLAY_TEMPLATE,
+        },
     )
 
 
-def init_db(conn: psycopg2.extensions.connection) -> None:
-    """Create tables if they don't exist and register the provider (name + display template)."""
-    with conn.cursor() as cur:
-        cur.execute(DDL)
-        cur.execute(
-            REGISTER_PROVIDER_SQL,
-            (PROVIDER_TYPE, DISPLAY_NAME, 10, json.dumps(DISPLAY_TEMPLATE)),
-        )
-    conn.commit()
+def add_source(url: str) -> int:
+    """Track a new repository URL and return its id."""
+    result = api_request("POST", "/sources", json={"url": url})
+    return result["id"]
 
 
-def upsert_repository(conn: psycopg2.extensions.connection, url: str) -> int:
-    """Insert a repository URL if it does not exist yet and return its id."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO repository (url, type)
-            VALUES (%s, 'changelog')
-            ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url
-            RETURNING id
-            """,
-            (url,),
-        )
-        row = cur.fetchone()
-    conn.commit()
-    return row[0]
+def get_sources() -> list[tuple[int, str, dict]]:
+    """Return all tracked sources as (id, url, config) tuples."""
+    result = api_request("GET", "/sources")
+    return [(s["id"], s["url"], s.get("config") or {}) for s in result["sources"]]
 
 
-def get_repositories(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
-    """Return all tracked repositories of type 'changelog' as a list of (id, url, config) tuples."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, url, config FROM repository WHERE type = 'changelog' ORDER BY id")
-        rows = cur.fetchall()
-        return [(row[0], row[1], json.loads(row[2]) if isinstance(row[2], str) else (row[2] or {})) for row in rows]
+def get_latest_version(repository_id: int) -> str | None:
+    """Return the version of the most recently stored entry, or None on first run."""
+    result = api_request("GET", f"/sources/{repository_id}/state")
+    return result["version"]
 
 
-def get_latest_entry(conn: psycopg2.extensions.connection, repository_id: int) -> tuple[str | None, str | None]:
-    """Return (version, content) of the most recent successful changelog entry.
-
-    Returns (None, None) if no entry exists yet.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT version, content FROM connector_changelog
-            WHERE repository_id = %s AND success = TRUE
-            ORDER BY executed_at DESC
-            LIMIT 1
-            """,
-            (repository_id,),
-        )
-        row = cur.fetchone()
-    return (row[0], row[1]) if row else (None, None)
-
-
-def get_saved_versions(conn: psycopg2.extensions.connection, repository_id: int) -> set[str]:
+def get_saved_versions(repository_id: int) -> set[str]:
     """Return the set of all release versions already saved for a repository."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT version FROM connector_changelog
-            WHERE repository_id = %s AND version IS NOT NULL
-            """,
-            (repository_id,),
-        )
-        return {row[0] for row in cur.fetchall()}
+    result = api_request("GET", f"/sources/{repository_id}/versions")
+    return set(result["versions"])
 
 
 def save_entry(
-    conn: psycopg2.extensions.connection,
-    repository_id: int,
-    version: str | None,
-    content: str,
-    changelog_date: datetime | None,
-    executed_at: datetime,
+    repository_id: int, version: str | None, content: str, changelog_date: datetime | None, executed_at: datetime
 ) -> None:
-    """Persist a changelog entry to the database."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO connector_changelog (repository_id, version, content, datetime, executed_at, success)
-            VALUES (%s, %s, %s, %s, %s, TRUE)
-            """,
-            (repository_id, version, content, changelog_date, executed_at),
-        )
-    conn.commit()
+    """Persist a single changelog entry."""
+    api_request(
+        "POST",
+        "/items",
+        json={
+            "items": [
+                {
+                    "repositoryId": repository_id,
+                    "version": version,
+                    "content": content,
+                    "datetime": changelog_date.isoformat() if changelog_date else None,
+                    "executedAt": executed_at.isoformat(),
+                    "success": True,
+                }
+            ]
+        },
+    )
 
 
-def cleanup_old_entries(conn: psycopg2.extensions.connection, repository_id: int, retention_days: int) -> None:
-    """Delete changelog entries for a repository older than retention_days days."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM connector_changelog WHERE repository_id = %s AND executed_at < NOW() - %s * INTERVAL '1 day'",
-            (repository_id, retention_days),
-        )
-    conn.commit()
+def cleanup_old_entries(repository_id: int, retention_days: int) -> None:
+    """Delete stored entries for a repository older than retention_days days."""
+    api_request(
+        "DELETE",
+        f"/sources/{repository_id}/old-items",
+        params={"retentionDays": retention_days},
+    )
 
 
-def save_error(
-    conn: psycopg2.extensions.connection,
-    repository_id: int | None,
-    error: str,
-    executed_at: datetime,
-) -> None:
-    """Persist a retrieval error to the log table."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO log (repository_id, error, executed_at)
-            VALUES (%s, %s, %s)
-            """,
-            (repository_id, error, executed_at),
-        )
-    conn.commit()
+def save_error(repository_id: int | None, error: str, executed_at: datetime) -> None:
+    """Persist a retrieval error."""
+    api_request(
+        "POST",
+        "/errors",
+        json={"repositoryId": repository_id, "error": error, "executedAt": executed_at.isoformat()},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +307,19 @@ def get_changelog_git_date(repo_dir: str, filename: str) -> datetime | None:
     return datetime.fromisoformat(date_str)
 
 
+def _content_hash(content: str) -> str:
+    """A short, stable dedup key for a file-based changelog, which has no
+    natural version of its own (unlike a GitHub release tag). Used as
+    `version` so file-based repos get the same dedup path (getLastKnownVersion)
+    as everything else, instead of needing the API to hand back raw content.
+
+    Trade-off accepted: the display template shows `$row.version` as the
+    subtitle, so a file-based entry's subtitle is this hash rather than blank
+    (as it was before). Only affects repos with zero GitHub releases — the
+    less common of the two paths."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
 def get_changelog_from_repo(repo_url: str) -> tuple[str | None, str, datetime | None]:
     """Clone the repository and read the changelog file.
 
@@ -418,33 +348,31 @@ def get_changelog_from_repo(repo_url: str) -> tuple[str | None, str, datetime | 
 # ---------------------------------------------------------------------------
 
 
-def process_repository(
-    conn: psycopg2.extensions.connection, repository_id: int, repository_url: str, executed_at: datetime, config: dict
-) -> None:
+def process_repository(repository_id: int, repository_url: str, executed_at: datetime, config: dict) -> None:
     """Fetch the latest release(s) (or changelog file) for one repository and persist new entries.
 
     Release-based repos:
     - If no previous entry exists, the latest release is stored as the initial snapshot.
     - Otherwise, iterates through recent GitHub releases (newest first) and saves every
-      release not already in the database, stopping when a known version is found.
+      release not already known, stopping when a known version is found.
       At most config["max_iterations"] (default 5) new entries are saved per run.
 
     File-based repos (no releases):
     - Saves the changelog file content whenever it differs from the last saved entry.
 
-    Any exception is caught, logged to the `log` table, and printed to stderr.
+    Any exception is caught, logged via the API, and printed to stderr.
     """
-    max_iterations = config.get("max_iterations", 5)
+    max_iterations = config.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     try:
         releases = get_releases(repository_url, limit=max_iterations)
 
         if releases:
-            saved_versions = get_saved_versions(conn, repository_id)
+            saved_versions = get_saved_versions(repository_id)
 
             if not saved_versions:
                 # First run: save only the latest release.
                 version, content, changelog_date = releases[0]
-                save_entry(conn, repository_id, version, content, changelog_date, executed_at)
+                save_entry(repository_id, version, content, changelog_date, executed_at)
             else:
                 count = 0
                 for version, content, changelog_date in releases:
@@ -452,18 +380,20 @@ def process_repository(
                         break
                     if version in saved_versions:
                         break
-                    save_entry(conn, repository_id, version, content, changelog_date, executed_at)
+                    save_entry(repository_id, version, content, changelog_date, executed_at)
                     count += 1
         else:
-            version, content, changelog_date = get_changelog_from_repo(repository_url)
-            prev_version, prev_content = get_latest_entry(conn, repository_id)
-            if prev_content is None:
-                save_entry(conn, repository_id, version, content, changelog_date, executed_at)
-            elif content != prev_content:
-                save_entry(conn, repository_id, version, content, changelog_date, executed_at)
+            _, content, changelog_date = get_changelog_from_repo(repository_url)
+            # Un fichier changelog n'a pas de version propre (contrairement à
+            # un tag de release) : son hash en tient lieu, pour dédoublonner
+            # sur GET /sources/:id/state comme partout ailleurs plutôt que de
+            # faire réexposer le contenu précédent par l'API.
+            version = _content_hash(content)
+            if version != get_latest_version(repository_id):
+                save_entry(repository_id, version, content, changelog_date, executed_at)
 
     except Exception as e:
-        save_error(conn, repository_id, str(e), executed_at)
+        save_error(repository_id, str(e), executed_at)
         print(f"[{repository_url}] Error: {e}", file=sys.stderr)
 
 
@@ -477,28 +407,23 @@ def main() -> None:
     parser.add_argument("--add", metavar="URL", help="Add a repository to track and exit.")
     args = parser.parse_args()
 
-    conn = get_db_conn()
-    try:
-        init_db(conn)
+    register_provider()
 
-        if args.add:
-            upsert_repository(conn, args.add)
-            print(f"Repository added: {args.add}")
-            return
+    if args.add:
+        add_source(args.add)
+        print(f"Repository added: {args.add}")
+        return
 
-        executed_at = datetime.now(tz=timezone.utc)
-        repositories = get_repositories(conn)
+    executed_at = datetime.now(tz=timezone.utc)
+    sources = get_sources()
 
-        if not repositories:
-            print("No repositories tracked. Use --add <url> to add one.")
-            return
+    if not sources:
+        print("No repositories tracked. Use --add <url> to add one.")
+        return
 
-        for repository_id, repository_url, config in repositories:
-            process_repository(conn, repository_id, repository_url, executed_at, config)
-            cleanup_old_entries(conn, repository_id, config.get("retention_days", 15))
-
-    finally:
-        conn.close()
+    for repository_id, repository_url, config in sources:
+        process_repository(repository_id, repository_url, executed_at, config)
+        cleanup_old_entries(repository_id, config.get("retention_days", DEFAULT_RETENTION_DAYS))
 
 
 if __name__ == "__main__":
