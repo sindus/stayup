@@ -1,4 +1,6 @@
-"""Unit tests — no external dependencies (DB, git, network)."""
+"""Unit tests — no external dependencies. stayup-api itself is mocked
+(unittest.mock.patch on `requests.request`); its actual behavior is covered
+by stayup-api's own test suite. Git and the GitHub releases API are mocked too."""
 
 import json
 from datetime import datetime, timezone
@@ -8,19 +10,21 @@ import pytest
 
 from check_changelog import (
     DISPLAY_TEMPLATE,
+    _content_hash,
+    add_source,
     cleanup_old_entries,
     clone_repo,
     find_changelog,
     get_changelog_git_date,
-    get_latest_entry,
+    get_latest_version,
     get_releases,
-    get_repositories,
     get_saved_versions,
-    init_db,
+    get_sources,
     parse_github_owner_repo,
+    process_repository,
+    register_provider,
     save_entry,
     save_error,
-    upsert_repository,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,41 +171,152 @@ class TestGetReleases:
 
 
 # ---------------------------------------------------------------------------
-# DB helpers
+# _content_hash
 # ---------------------------------------------------------------------------
 
 
-def make_conn_mock():
-    conn = MagicMock()
-    cursor = MagicMock()
-    conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
-    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-    return conn, cursor
+class TestContentHash:
+    def test_stable_for_the_same_content(self):
+        assert _content_hash("## v1\n- a") == _content_hash("## v1\n- a")
+
+    def test_differs_for_different_content(self):
+        assert _content_hash("a") != _content_hash("b")
 
 
-class TestInitDb:
-    def test_runs_ddl_then_registers_provider_and_commits(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        assert cursor.execute.call_count == 2  # DDL, then registry upsert
-        conn.commit.assert_called_once()
+# ---------------------------------------------------------------------------
+# api_request helpers
+# ---------------------------------------------------------------------------
 
-    def test_ddl_creates_registry_with_template_column(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        ddl = cursor.execute.call_args_list[0].args[0]
-        assert "CREATE TABLE IF NOT EXISTS provider_registry" in ddl
-        assert "ADD COLUMN IF NOT EXISTS template" in ddl
 
-    def test_registers_provider_name_and_display_template(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        sql, params = cursor.execute.call_args_list[1].args
-        assert "INSERT INTO provider_registry" in sql
-        assert "template" in sql
-        name, display, sort_order, template_json = params
-        assert (name, display, sort_order) == ("changelog", "Changelog", 10)
-        assert json.loads(template_json) == DISPLAY_TEMPLATE
+def mock_response(json_body=None, status=200):
+    response = MagicMock()
+    response.status_code = status
+    response.content = b"{}" if json_body is not None else b""
+    response.json.return_value = json_body
+    response.raise_for_status.return_value = None
+    return response
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestRegisterProvider:
+    @patch("check_changelog.requests.request")
+    def test_posts_display_name_sort_order_and_template(self, mock_request):
+        mock_request.return_value = mock_response()
+        register_provider()
+        method, url = mock_request.call_args[0]
+        assert method == "POST"
+        assert url.endswith("/connector-api/changelog/register")
+        body = mock_request.call_args.kwargs["json"]
+        assert body["displayName"] == "Changelog"
+        assert body["sortOrder"] == 10
+        assert body["template"] == DISPLAY_TEMPLATE
+
+
+class TestApiRequestWithoutKey:
+    @patch("check_changelog.API_KEY", None)
+    def test_raises_when_no_api_key_is_configured(self):
+        with pytest.raises(RuntimeError, match="STAYUP_API_KEY"):
+            register_provider()
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestAddSource:
+    @patch("check_changelog.requests.request")
+    def test_posts_the_url_and_returns_the_id(self, mock_request):
+        mock_request.return_value = mock_response({"id": 42, "url": "https://github.com/user/repo"})
+        assert add_source("https://github.com/user/repo") == 42
+        method, url = mock_request.call_args[0]
+        assert method == "POST"
+        assert url.endswith("/connector-api/changelog/sources")
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestGetSources:
+    @patch("check_changelog.requests.request")
+    def test_returns_id_url_config_tuples(self, mock_request):
+        mock_request.return_value = mock_response(
+            {"sources": [{"id": 1, "url": "https://github.com/a/b", "config": {"max_iterations": 3}}]}
+        )
+        assert get_sources() == [(1, "https://github.com/a/b", {"max_iterations": 3})]
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestGetLatestVersion:
+    @patch("check_changelog.requests.request")
+    def test_returns_none_on_first_run(self, mock_request):
+        mock_request.return_value = mock_response({"version": None})
+        assert get_latest_version(1) is None
+
+    @patch("check_changelog.requests.request")
+    def test_returns_the_version(self, mock_request):
+        mock_request.return_value = mock_response({"version": "v1.0.0"})
+        assert get_latest_version(1) == "v1.0.0"
+        url = mock_request.call_args[0][1]
+        assert url.endswith("/connector-api/changelog/sources/1/state")
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestGetSavedVersions:
+    @patch("check_changelog.requests.request")
+    def test_returns_set_of_versions(self, mock_request):
+        mock_request.return_value = mock_response({"versions": ["v1.0.0", "v1.1.0"]})
+        assert get_saved_versions(1) == {"v1.0.0", "v1.1.0"}
+        url = mock_request.call_args[0][1]
+        assert url.endswith("/connector-api/changelog/sources/1/versions")
+
+    @patch("check_changelog.requests.request")
+    def test_returns_empty_set_when_no_entries(self, mock_request):
+        mock_request.return_value = mock_response({"versions": []})
+        assert get_saved_versions(1) == set()
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestSaveEntry:
+    @patch("check_changelog.requests.request")
+    def test_posts_a_single_item_with_version(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        executed_at = datetime.now(tz=timezone.utc)
+        save_entry(1, "v1.0.0", "## v1.0\n- init", None, executed_at)
+        item = mock_request.call_args.kwargs["json"]["items"][0]
+        assert item["repositoryId"] == 1
+        assert item["version"] == "v1.0.0"
+        assert item["content"] == "## v1.0\n- init"
+        assert item["success"] is True
+
+    @patch("check_changelog.requests.request")
+    def test_accepts_a_none_version(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        save_entry(1, None, "content", None, datetime.now(tz=timezone.utc))
+        assert mock_request.call_args.kwargs["json"]["items"][0]["version"] is None
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestSaveError:
+    @patch("check_changelog.requests.request")
+    def test_posts_the_error(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        executed_at = datetime.now(tz=timezone.utc)
+        save_error(5, "something went wrong", executed_at)
+        body = mock_request.call_args.kwargs["json"]
+        assert body == {"repositoryId": 5, "error": "something went wrong", "executedAt": executed_at.isoformat()}
+
+    @patch("check_changelog.requests.request")
+    def test_accepts_none_repository_id(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        save_error(None, "error", datetime.now(tz=timezone.utc))
+        assert mock_request.call_args.kwargs["json"]["repositoryId"] is None
+
+
+@patch("check_changelog.API_KEY", "test-key")
+class TestCleanupOldEntries:
+    @patch("check_changelog.requests.request")
+    def test_sends_retention_days_as_a_query_param(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        cleanup_old_entries(7, 30)
+        method, url = mock_request.call_args[0]
+        assert method == "DELETE"
+        assert url.endswith("/connector-api/changelog/sources/7/old-items")
+        assert mock_request.call_args.kwargs["params"] == {"retentionDays": 30}
 
 
 class TestDisplayTemplate:
@@ -209,8 +324,6 @@ class TestDisplayTemplate:
         assert json.loads(json.dumps(DISPLAY_TEMPLATE)) == DISPLAY_TEMPLATE
 
     def test_ships_a_self_describing_icon(self):
-        # Le connecteur fournit son icône (tracé SVG teintable), pas une clé du
-        # jeu intégré des apps : un nouveau connecteur s'affiche sans toucher au code.
         icon = DISPLAY_TEMPLATE["display"]["icon"]
         assert isinstance(icon, dict)
         assert icon["paths"]
@@ -224,135 +337,98 @@ class TestDisplayTemplate:
         assert "{repo}" in DISPLAY_TEMPLATE["detail"]["openUrl"]
 
 
-class TestUpsertRepository:
-    def test_returns_id(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchone.return_value = (42,)
-        result = upsert_repository(conn, "https://github.com/user/repo")
-        assert result == 42
-        sql = cursor.execute.call_args[0][0]
-        assert "INSERT INTO repository" in sql
-        assert "ON CONFLICT" in sql
-
-    def test_passes_url_as_parameter(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchone.return_value = (1,)
-        upsert_repository(conn, "https://github.com/user/repo")
-        params = cursor.execute.call_args[0][1]
-        assert params == ("https://github.com/user/repo",)
+# ---------------------------------------------------------------------------
+# process_repository — end to end, stayup-api and GitHub/git mocked
+# ---------------------------------------------------------------------------
 
 
-class TestGetRepositories:
-    def test_returns_list_of_tuples(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = [
-            (1, "https://github.com/a/b", {"max_entries": 3}),
-            (2, "https://github.com/c/d", {}),
+@patch("check_changelog.API_KEY", "test-key")
+class TestProcessRepository:
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_saved_versions")
+    @patch("check_changelog.get_releases")
+    def test_first_run_via_release_stores_only_latest(self, mock_releases, mock_saved, mock_save, mock_save_error):
+        mock_releases.return_value = [
+            ("v1.1.0", "newer", datetime(2024, 6, 1, tzinfo=timezone.utc)),
+            ("v1.0.0", "older", datetime(2024, 1, 1, tzinfo=timezone.utc)),
         ]
-        result = get_repositories(conn)
-        assert result == [
-            (1, "https://github.com/a/b", {"max_entries": 3}),
-            (2, "https://github.com/c/d", {}),
+        mock_saved.return_value = set()
+        executed_at = datetime.now(tz=timezone.utc)
+        process_repository(1, "https://github.com/user/repo", executed_at, {})
+
+        mock_save.assert_called_once_with(1, "v1.1.0", "newer", datetime(2024, 6, 1, tzinfo=timezone.utc), executed_at)
+        mock_save_error.assert_not_called()
+
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_saved_versions")
+    @patch("check_changelog.get_releases")
+    def test_no_insert_when_the_known_version_is_first(self, mock_releases, mock_saved, mock_save, _err):
+        mock_releases.return_value = [("v1.0.0", "body", None)]
+        mock_saved.return_value = {"v1.0.0"}
+        process_repository(1, "https://github.com/user/repo", datetime.now(tz=timezone.utc), {})
+        mock_save.assert_not_called()
+
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_saved_versions")
+    @patch("check_changelog.get_releases")
+    def test_saves_new_releases_until_the_known_one(self, mock_releases, mock_saved, mock_save, _err):
+        mock_releases.return_value = [
+            ("v1.2.0", "b", None),
+            ("v1.1.0", "b", None),
+            ("v1.0.0", "b", None),
         ]
+        mock_saved.return_value = {"v1.0.0"}
+        process_repository(1, "https://github.com/user/repo", datetime.now(tz=timezone.utc), {})
 
-    def test_returns_empty_list_when_no_repos(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = []
-        result = get_repositories(conn)
-        assert result == []
+        saved_versions = [call.args[1] for call in mock_save.call_args_list]
+        assert saved_versions == ["v1.2.0", "v1.1.0"]
 
-    def test_filters_by_changelog_type(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = []
-        get_repositories(conn)
-        sql = cursor.execute.call_args[0][0]
-        assert "type = 'changelog'" in sql
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_saved_versions")
+    @patch("check_changelog.get_releases")
+    def test_capped_at_max_iterations(self, mock_releases, mock_saved, mock_save, _err):
+        mock_releases.return_value = [(f"v{i}", "b", None) for i in range(5, 0, -1)]
+        mock_saved.return_value = {"v0"}  # never matched: all 5 are "new"
+        process_repository(1, "https://github.com/user/repo", datetime.now(tz=timezone.utc), {"max_iterations": 2})
+        assert mock_save.call_count == 2
 
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.get_latest_version")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_changelog_from_repo")
+    @patch("check_changelog.get_releases")
+    def test_falls_back_to_file_when_no_releases(self, mock_releases, mock_from_repo, mock_save, mock_get_latest, _err):
+        mock_releases.return_value = []
+        mock_from_repo.return_value = (None, "## Changelog\n- v1", None)
+        mock_get_latest.return_value = None
+        process_repository(1, "https://github.com/user/repo", datetime.now(tz=timezone.utc), {})
 
-class TestGetLatestEntry:
-    def test_returns_version_and_content_when_found(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchone.return_value = ("v1.0.0", "release notes")
-        version, content = get_latest_entry(conn, 1)
-        assert version == "v1.0.0"
-        assert content == "release notes"
+        mock_save.assert_called_once()
+        assert mock_save.call_args[0][2] == "## Changelog\n- v1"
 
-    def test_returns_none_none_when_no_entry(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchone.return_value = None
-        version, content = get_latest_entry(conn, 1)
-        assert version is None
-        assert content is None
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.get_latest_version")
+    @patch("check_changelog.save_entry")
+    @patch("check_changelog.get_changelog_from_repo")
+    @patch("check_changelog.get_releases")
+    def test_file_fallback_no_insert_when_content_unchanged(
+        self, mock_releases, mock_from_repo, mock_save, mock_get_latest, _err
+    ):
+        content = "## Changelog\n- v1"
+        mock_releases.return_value = []
+        mock_from_repo.return_value = (None, content, None)
+        mock_get_latest.return_value = _content_hash(content)
+        process_repository(1, "https://github.com/user/repo", datetime.now(tz=timezone.utc), {})
+        mock_save.assert_not_called()
 
-
-class TestGetSavedVersions:
-    def test_returns_set_of_versions(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = [("v1.0.0",), ("v1.1.0",)]
-        result = get_saved_versions(conn, 1)
-        assert result == {"v1.0.0", "v1.1.0"}
-
-    def test_returns_empty_set_when_no_entries(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = []
-        result = get_saved_versions(conn, 1)
-        assert result == set()
-
-
-class TestSaveEntry:
-    def test_inserts_with_version_and_commits(self):
-        conn, cursor = make_conn_mock()
+    @patch("check_changelog.save_error")
+    @patch("check_changelog.get_releases")
+    def test_logs_error_on_failure(self, mock_releases, mock_save_error):
+        mock_releases.side_effect = Exception("network error")
         executed_at = datetime.now(tz=timezone.utc)
-        save_entry(conn, 1, "v1.0.0", "## v1.0\n- init", None, executed_at)
-        cursor.execute.assert_called_once()
-        conn.commit.assert_called_once()
-        params = cursor.execute.call_args[0][1]
-        assert params[0] == 1  # repository_id
-        assert params[1] == "v1.0.0"  # version
-        assert params[2] == "## v1.0\n- init"  # content
-        assert params[4] == executed_at
-
-    def test_success_flag_in_sql(self):
-        conn, cursor = make_conn_mock()
-        save_entry(conn, 1, None, "content", None, datetime.now(tz=timezone.utc))
-        sql = cursor.execute.call_args[0][0]
-        assert "TRUE" in sql
-
-    def test_no_diff_column_in_sql(self):
-        conn, cursor = make_conn_mock()
-        save_entry(conn, 1, None, "content", None, datetime.now(tz=timezone.utc))
-        sql = cursor.execute.call_args[0][0]
-        assert "diff" not in sql.lower()
-
-
-class TestSaveError:
-    def test_inserts_error_and_commits(self):
-        conn, cursor = make_conn_mock()
-        executed_at = datetime.now(tz=timezone.utc)
-        save_error(conn, 5, "something went wrong", executed_at)
-        cursor.execute.assert_called_once()
-        conn.commit.assert_called_once()
-        params = cursor.execute.call_args[0][1]
-        assert params == (5, "something went wrong", executed_at)
-
-    def test_accepts_none_repository_id(self):
-        conn, cursor = make_conn_mock()
-        save_error(conn, None, "error", datetime.now(tz=timezone.utc))
-        params = cursor.execute.call_args[0][1]
-        assert params[0] is None
-
-
-class TestCleanupOldEntries:
-    def test_executes_delete_and_commits(self):
-        conn, cursor = make_conn_mock()
-        cleanup_old_entries(conn, 1, 15)
-        cursor.execute.assert_called_once()
-        conn.commit.assert_called_once()
-        sql = cursor.execute.call_args[0][0]
-        assert "DELETE FROM connector_changelog" in sql
-
-    def test_uses_repository_id_and_retention_days(self):
-        conn, cursor = make_conn_mock()
-        cleanup_old_entries(conn, 7, 30)
-        params = cursor.execute.call_args[0][1]
-        assert params == (7, 30)
+        process_repository(1, "https://github.com/user/repo", executed_at, {})
+        mock_save_error.assert_called_once_with(1, "network error", executed_at)

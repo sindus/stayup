@@ -21,6 +21,7 @@ jobs:
 
       - name: Run changelog check
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          STAYUP_API_URL: ${{ secrets.STAYUP_API_URL }}
+          STAYUP_API_KEY: ${{ secrets.STAYUP_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python check_changelog.py

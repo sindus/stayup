@@ -5,13 +5,15 @@
 
 **Website:** https://stayup-ui.vercel.app
 
-Monitors GitHub releases and stores changelogs in a PostgreSQL database.
+Monitors GitHub releases and stores changelogs via [stayup-api](https://github.com/stayup-app/stayup-api) — this script never touches a database directly, it only calls `stayup-api`'s `/connector-api/changelog/*` endpoints.
 
-For each tracked repository, the script fetches the latest GitHub release. If no release exists, it falls back to reading a changelog file from the repository. A new entry is only stored when something has changed since the last run. The three most recent entries per repository are kept.
+For each tracked repository, the script fetches the latest GitHub release(s). If no release exists, it falls back to reading a changelog file from the repository. A new entry is only stored when something has changed since the last run.
 
 ## Requirements
 
-- [Docker](https://www.docker.com/) and Docker Compose
+- Python 3.13, or [Docker](https://www.docker.com/)
+- A `stayup-api` instance (the public one, or your own — see [self-hosting-and-providers.md](https://github.com/stayup-app/stayup-api/blob/main/docs/self-hosting-and-providers.md))
+- An API key for the `changelog` provider, created from that instance's admin panel (Connector keys → New key, provider `changelog`). The key is shown once — copy it right away.
 
 ## Setup
 
@@ -21,28 +23,11 @@ cd stayup-cmd-changelog
 cp .env.example .env
 ```
 
-Open `.env` and configure your database connection.
+Open `.env` and set `STAYUP_API_URL` (your `stayup-api` instance) and `STAYUP_API_KEY` (the key you created for `changelog`). Optionally set `GITHUB_TOKEN` to raise the GitHub API rate limit from 60 to 5000 requests/hour.
 
-### Option A — Local database (Docker)
-
-The default values in `.env` work out of the box with the bundled `db` service. No changes needed.
-
-### Option B — External database (Render, Railway, etc.)
-
-Set the full connection URL in `.env`:
-
-```env
-DATABASE_URL=postgresql://user:password@host:5432/dbname
-```
-
-> **Note:** Tables are created automatically on the first run.
+> **Note:** the provider registers itself automatically on every run — nothing to create by hand beyond the key.
 
 ## Usage
-
-**Start the database:**
-```bash
-docker compose up db -d
-```
 
 **Track a repository:**
 ```bash
@@ -55,19 +40,17 @@ docker compose run --rm check_changelog --add https://github.com/vercel/next.js
 docker compose run --rm check_changelog
 ```
 
-**Browse the database (pgAdmin):**
+Without Docker:
 ```bash
-docker compose up pgadmin -d
+pip install -r requirements.txt
+STAYUP_API_URL=... STAYUP_API_KEY=... python check_changelog.py
 ```
-Open [http://localhost:5050](http://localhost:5050) — credentials: `admin@admin.com` / `admin`
-
-Connect to the server using host `db`, port `5432`, and the credentials from your `.env`.
 
 ## Automation
 
 The script runs automatically every night at midnight UTC via GitHub Actions.
 
-To enable it on your fork, add a `DATABASE_URL` secret in:
+To enable it on your fork, add `STAYUP_API_URL` and `STAYUP_API_KEY` secrets in:
 **Settings → Secrets and variables → Actions → New repository secret**
 
 You can also trigger the workflow manually from the **Actions → Daily changelog check → Run workflow** tab.
@@ -81,8 +64,7 @@ Optionally, add a `GITHUB_TOKEN` secret to raise the GitHub API rate limit from 
 cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 ```
 
-
-**Run tests:**
+**Run tests** (no external dependencies — `stayup-api`, git and the GitHub API are mocked):
 ```bash
 docker compose run --rm test
 ```
@@ -97,35 +79,19 @@ docker compose run --rm --entrypoint="" test sh -c "ruff check . && black --chec
 docker run --rm --entrypoint="" -v $(pwd):/app -w /app stayup-test black .
 ```
 
-## Database schema
+## What gets stored
 
-| Table | Description |
-|---|---|
-| `repository` | Tracked repositories |
-| `connector_changelog` | Stored releases/changelogs (last 3 per repository) |
-| `log` | Errors encountered during retrieval |
-
-### `connector_changelog` columns
-
-| Column | Description |
-|---|---|
-| `version` | Release tag (e.g. `v1.2.0`), null for file-based changelogs |
-| `content` | Full release body or changelog file content |
-| `diff` | Unified diff against the previous entry, null on first run |
-| `datetime` | Publication date from GitHub or last git commit date |
-| `executed_at` | Timestamp when the script ran |
-| `success` | Always `true` — errors are stored in the `log` table |
+Each stored entry's `content` is the full release body (or changelog file content) as plain text, keyed by release tag (`version` — e.g. `v1.2.0`). A file-based changelog (no GitHub release) has no natural version, so a short hash of its content is used instead, purely for dedup — see `stayup-api`'s `connector-api` docs for the full contract.
 
 ## Project structure
 
 ```
 stayup-cmd-changelog/
-├── check_changelog.py      # Main script
+├── check_changelog.py  # Main script
 ├── tests/
-│   ├── test_unit.py        # Unit tests (no external dependencies)
-│   └── test_functional.py  # Functional tests (require PostgreSQL)
-├── .env.example            # Configuration template
+│   └── test_unit.py    # Tests — stayup-api, git and the GitHub API are mocked
+├── .env.example         # Configuration template
 ├── docker-compose.yml
 ├── Dockerfile
-└── pyproject.toml          # Ruff + Black configuration
+└── pyproject.toml      # Ruff + Black configuration
 ```
