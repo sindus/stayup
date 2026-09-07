@@ -41,33 +41,33 @@ CHANGELOG_NAMES = [
 
 PROVIDER_TYPE = "changelog"
 
-# Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
+# Display name of the provider in the apps (fallback: capitalized table name).
 DISPLAY_NAME = "Changelog"
 
-# Où ce connecteur se classe parmi les autres dans la barre latérale.
+# Where this connector ranks among the others in the sidebar.
 SORT_ORDER = 10
 
-# Instance stayup-api à laquelle parler, et la clé qui authentifie ce
-# connecteur pour le provider 'changelog' — obtenue depuis l'admin de cette
-# instance (voir stayup-api/docs/self-hosting-and-providers.md).
+# The stayup-api instance to talk to, and the key that authenticates this
+# connector for the 'changelog' provider — obtained from that instance's admin
+# (see stayup-api/docs/self-hosting-and-providers.md).
 API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
 API_KEY = os.environ.get("STAYUP_API_KEY")
 
 DEFAULT_MAX_ITERATIONS = 5
 
-# Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
-# lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
-# tel quel depuis provider_registry.template, sans jamais l'interpréter.
-# Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
+# Display manifest: how the 3 apps (ui / desktop / mobile) render this
+# connector's rows, without a line of code on the app side. stayup-api relays it
+# as-is from provider_registry.template, without ever interpreting it.
+# Schema: see stayup-api/docs/self-hosting-and-providers.md.
 #
-# Une entrée = une release. `content` est du texte brut (markdown léger), le
-# dépôt vient de la source (repository.url).
+# One entry = a release. `content` is raw text (light markdown), the repo
+# comes from the source (repository.url).
 DISPLAY_TEMPLATE = {
     "version": 1,
     "display": {
         "name": DISPLAY_NAME,
-        # Icône auto-descriptive (tracé SVG teintable, langage visuel des apps :
-        # trait 1.75, currentColor). Un tag de release.
+        # Self-describing icon (tintable SVG path, the apps' visual language:
+        # 1.75 stroke, currentColor). A release tag.
         "icon": {
             "paths": [
                 "M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z",
@@ -140,7 +140,7 @@ def api_request(method: str, path: str, **kwargs) -> dict | None:
 
 
 def register_provider() -> None:
-    """Auto-déclaration au démarrage — nom affiché et manifeste d'affichage."""
+    """Self-declaration at startup — display name and display manifest."""
     api_request(
         "POST",
         "/register",
@@ -374,10 +374,10 @@ def process_repository(repository_id: int, repository_url: str, executed_at: dat
                     count += 1
         else:
             _, content, changelog_date = get_changelog_from_repo(repository_url)
-            # Un fichier changelog n'a pas de version propre (contrairement à
-            # un tag de release) : son hash en tient lieu, pour dédoublonner
-            # sur GET /sources/:id/state comme partout ailleurs plutôt que de
-            # faire réexposer le contenu précédent par l'API.
+            # A changelog file has no version of its own (unlike a release
+            # tag): its hash stands in, to dedupe on GET /sources/:id/state like
+            # everywhere else rather than have the API re-expose the previous
+            # content.
             version = _content_hash(content)
             if version != get_latest_version(repository_id):
                 save_entry(repository_id, version, content, changelog_date, executed_at)
