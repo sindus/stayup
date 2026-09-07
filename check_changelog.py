@@ -5,7 +5,7 @@ Stayup — monitors GitHub releases and stores changelogs via stayup-api.
 For each tracked repository, the script fetches recent GitHub releases.
 If no releases exist, it falls back to cloning the repo and reading a
 changelog file. New content is stored only when something has changed
-since the last run. Entries older than config["retention_days"] are deleted each run.
+since the last run.
 
 Talks to stayup-api over HTTP (STAYUP_API_URL + STAYUP_API_KEY) — it never
 touches a database directly. See stayup-api/docs/self-hosting-and-providers.md.
@@ -54,7 +54,6 @@ API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
 API_KEY = os.environ.get("STAYUP_API_KEY")
 
 DEFAULT_MAX_ITERATIONS = 5
-DEFAULT_RETENTION_DAYS = 15
 
 # Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
 # lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
@@ -196,15 +195,6 @@ def save_entry(
                 }
             ]
         },
-    )
-
-
-def cleanup_old_entries(repository_id: int, retention_days: int) -> None:
-    """Delete stored entries for a repository older than retention_days days."""
-    api_request(
-        "DELETE",
-        f"/sources/{repository_id}/old-items",
-        params={"retentionDays": retention_days},
     )
 
 
@@ -423,7 +413,6 @@ def main() -> None:
 
     for repository_id, repository_url, config in sources:
         process_repository(repository_id, repository_url, executed_at, config)
-        cleanup_old_entries(repository_id, config.get("retention_days", DEFAULT_RETENTION_DAYS))
 
 
 if __name__ == "__main__":

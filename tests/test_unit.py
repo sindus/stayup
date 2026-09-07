@@ -12,7 +12,6 @@ from check_changelog import (
     DISPLAY_TEMPLATE,
     _content_hash,
     add_source,
-    cleanup_old_entries,
     clone_repo,
     find_changelog,
     get_changelog_git_date,
@@ -305,18 +304,6 @@ class TestSaveError:
         mock_request.return_value = mock_response({"success": True})
         save_error(None, "error", datetime.now(tz=timezone.utc))
         assert mock_request.call_args.kwargs["json"]["repositoryId"] is None
-
-
-@patch("check_changelog.API_KEY", "test-key")
-class TestCleanupOldEntries:
-    @patch("check_changelog.requests.request")
-    def test_sends_retention_days_as_a_query_param(self, mock_request):
-        mock_request.return_value = mock_response({"success": True})
-        cleanup_old_entries(7, 30)
-        method, url = mock_request.call_args[0]
-        assert method == "DELETE"
-        assert url.endswith("/connector-api/changelog/sources/7/old-items")
-        assert mock_request.call_args.kwargs["params"] == {"retentionDays": 30}
 
 
 class TestDisplayTemplate:
